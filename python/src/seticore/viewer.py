@@ -1,24 +1,23 @@
-#!/usr/bin/env python
-
-import matplotlib
-matplotlib.rc("figure", max_open_warning=0)
-from matplotlib import pyplot as plt
-
-import capnp
-capnp.remove_import_hook()
+try:
+    import matplotlib
+    matplotlib.rc("figure", max_open_warning=0)
+    from matplotlib import pyplot as plt
+except ImportError:
+    matplotlib = None
 
 import h5py
 import math
 import numpy as np
 import os
-import pandas as pd
+import traceback
 
-SETICORE_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-hit_capnp = capnp.load(SETICORE_DIR + "/hit.capnp")
-stamp_capnp = capnp.load(SETICORE_DIR + "/stamp.capnp")
+from seticore import hit_capnp, stamp_capnp
 
-def read_hits(filename):
-    with open(filename) as f:
+def _import_matplotlib():
+    from matplotlib import pyplot as plt
+
+def read_hits(filepath):
+    with open(filepath) as f:
         hits = hit_capnp.Hit.read_multiple(f)
         for hit in hits:
             yield hit
@@ -31,6 +30,7 @@ def beam_name(hit):
 
 def plot_array(arr, cmap="viridis"):
     # TODO: decide size intelligently
+    _import_matplotlib()
     fig, ax = plt.subplots(figsize=(10, 2), dpi=300)
     ax.imshow(arr, rasterized=True, interpolation="nearest", cmap=cmap, aspect="auto")
     return fig, ax
@@ -63,7 +63,8 @@ def plot_multiple(named_waterfalls):
     else:
         cols = 12
     rows = math.ceil(len(named_waterfalls) / cols)
-    fig, axs = plt.subplots(rows, cols, figsize=(cols*4, rows*3), dpi=300)
+    _import_matplotlib()
+    fig, axs = plt.subplots(rows, cols, figsize=(cols*4, rows*3), squeeze=False, dpi=300)
     for i in range(rows * cols):
         row = i // cols
         col = i % cols
@@ -79,17 +80,7 @@ def plot_multiple(named_waterfalls):
     fig.tight_layout()
     fig.subplots_adjust(hspace=0.8)
     return fig, axs
-
-def show_multiple(named_waterfalls):
-    """
-    Show multiple waterfalls.
-
-    named_waterfalls is a list of (name, waterfall).
-    waterfall is an array indexed like [time, chan]
-    """
-    fig, axs = plot_multiple(named_waterfalls)
-    plt.show()
-    plt.close()
+    
 
 def round_up_power_of_two(n):
     assert n >= 1
@@ -130,8 +121,8 @@ def interpolate_drift(total_drift, timesteps):
     
     
 class Recipe(object):
-    def __init__(self, filename):
-        self.h5 = h5py.File(filename)
+    def __init__(self, filepath):
+        self.h5 = h5py.File(filepath)
         self.ras = self.h5["/beaminfo/ras"][()]
         self.decs = self.h5["/beaminfo/decs"][()]
         self.obsid = self.h5["/obsinfo/obsid"][()]
@@ -144,7 +135,7 @@ class Recipe(object):
         self.nants = self.h5["/diminfo/nants"][()]
         self.nchan = self.h5["/diminfo/nchan"][()]
 
-        self.antenna_names = [s.decode("utf-8")
+        self.antenna_names = [s.decode("utf-8") if isinstance(s, bytes) else s
                               for s in self.h5["/telinfo/antenna_names"][()]]
         
         # Validate shapes of things
@@ -185,12 +176,63 @@ class Stamp(object):
         real = self.real_array()
         return real[:, :, :, :, 0] + 1.0j * real[:, :, :, :, 1]
 
-    def show_classic_incoherent(self):
+    def show_classic_incoherent(self, title=None, show_signal=False, save_to=None):
         incoherent = np.square(self.real_array()).sum(axis=(2, 3, 4))
         snr, sig = self.snr_and_signal(incoherent)
         print(f"recalculated power: {sig:e}")
         print("local SNR:", snr)
-        show_array(incoherent)
+
+        # Plot the array
+        fig, ax = plot_array(incoherent)
+
+        # Add good plot tick marks and labels
+        yticks = ax.get_yticks()
+        ax.set_yticklabels([
+            f"{tick*self.stamp.tsamp*1e3:0.3f}"
+            for tick in yticks
+        ])
+        ax.set_ylabel("ms")
+        xticks = ax.get_xticks()
+        ax.set_xticklabels([
+            f"{(tick*self.stamp.foff*1000):0.1f}"
+            for tick in xticks
+        ])
+        ax.set_xlabel(f"Frequency (kHz + {self.stamp.fch1:0.6f} MHz)")
+
+        # Plot detected signal if given
+        if show_signal and (ax.axison):
+            frequency = self.stamp.signal.frequency
+            drift_rate = self.stamp.signal.driftRate
+            # Figure out where the frequency is in plot coordinates
+            # plot_width = self.stamp.numChannels * self.stamp.foff
+            plot_frequency_x = ((frequency - self.stamp.fch1)) / self.stamp.foff
+            if drift_rate == 0:
+                # Plot vertical line
+                ax.axvline(plot_frequency_x, color='red', dashes=[1, 1, 1, 1], zorder=10000) # frequency in MHz, convert to KHz
+                ax.plot()
+            else:
+                # find the frequency limits
+                max_time_s = self.stamp.tsamp * self.stamp.numTimesteps
+                # xaxis = np.linspace(plot_frequency_x, plot_frequency_x + (drift_rate * 1e6 / self.stamp.foff) * max_time_s, num=4)
+                xaxis = np.linspace(plot_frequency_x, plot_frequency_x + self.stamp.signal.driftSteps, num=4)
+                yaxis = np.linspace(0, self.stamp.numTimesteps - 1, num=4)
+                ax.plot(xaxis, yaxis, color='red', dashes=[1, 1, 1, 1], zorder=10000)
+        else:
+            ax.plot()
+        
+        # Plot a title if one is provided
+        if title != None:
+            plt.title(title)
+
+        # Save figure to file if selected
+        if save_to == None:
+            plt.show()
+        else:
+            plt.savefig(save_to)
+        plt.close()
+
+        
+
 
     def weighted_incoherent(self):
         # Start off like we're beamforming beam 0
@@ -204,14 +246,61 @@ class Stamp(object):
         # Then sum along polarization and antenna
         return power.sum(axis=(2, 3))
 
-    def show_weighted_incoherent(self):
+    def show_weighted_incoherent(self, title=None, show_signal=False, save_to=None):
         incoherent = self.weighted_incoherent()
         snr, sig = self.snr_and_signal(incoherent)
         print(f"recalculated power: {sig:e}")
         print("local SNR:", snr)
-        show_array(incoherent)
+        # Plot the array
+        fig, ax = plot_array(incoherent)
+
+        # Add good plot tick marks and labels
+        yticks = ax.get_yticks()
+        ax.set_yticklabels([
+            f"{tick*self.stamp.tsamp*1e3:0.3f}"
+            for tick in yticks
+        ])
+        ax.set_ylabel("ms")
+        xticks = ax.get_xticks()
+        ax.set_xticklabels([
+            f"{(tick*self.stamp.foff*1000):0.1f}"
+            for tick in xticks
+        ])
+        ax.set_xlabel(f"Frequency (kHz + {self.stamp.fch1:0.6f} MHz)")
+
+        # Plot detected signal if given
+        if show_signal and (ax.axison):
+            frequency = self.stamp.signal.frequency
+            drift_rate = self.stamp.signal.driftRate
+            # Figure out where the frequency is in plot coordinates
+            # plot_width = self.stamp.numChannels * self.stamp.foff
+            plot_frequency_x = ((frequency - self.stamp.fch1)) / self.stamp.foff
+            if drift_rate == 0:
+                # Plot vertical line
+                ax.axvline(plot_frequency_x, color='red', dashes=[1, 1, 1, 1], zorder=10000) # frequency in MHz, convert to KHz
+                ax.plot()
+            else:
+                # find the frequency limits
+                max_time_s = self.stamp.tsamp * self.stamp.numTimesteps
+                # xaxis = np.linspace(plot_frequency_x, plot_frequency_x + (drift_rate * 1e6 / self.stamp.foff) * max_time_s, num=4)
+                xaxis = np.linspace(plot_frequency_x, plot_frequency_x + self.stamp.signal.driftSteps, num=4)
+                yaxis = np.linspace(0, self.stamp.numTimesteps - 1, num=4)
+                ax.plot(xaxis, yaxis, color='red', dashes=[1, 1, 1, 1], zorder=10000)
+        else:
+            ax.plot()
+        
+        # Plot a title if one is provided
+        if title != None:
+            plt.title(title)
+
+        # Save figure to file if selected
+        if save_to == None:
+            plt.show()
+        else:
+            plt.savefig(save_to)
+        plt.close()
     
-    def show_antenna(self, index):
+    def show_antenna(self, index, title=None, save_to=None):
         voltages = self.real_array()[:, :, :, index, :]
         powers = np.square(voltages).sum(axis=(2, 3))
         fig, ax = plot_array(powers)
@@ -230,18 +319,31 @@ class Stamp(object):
         ])
         ax.set_xlabel("Frequency (MHz)")
         
-        display(fig)
+        # Plot a title if one is provided
+        if title != None:
+            plt.title(title)
+
+        # Save figure to file if selected
+        if save_to == None:
+            plt.show()
+        else:
+            plt.savefig(save_to)
         plt.close()
 
-    def show_antennas(self):
+    # Title is a string for the whole plot
+    def show_antennas(self, title=None, show_signal=False, save_to=None):
         antennas = np.square(self.real_array()).sum(axis=(2, 4))
-        fig, axs = plot_multiple([(f"antenna {i}", antennas[:, :, i])
+        antenna_titles = [f"antenna {i}" for i in range(self.stamp.numAntennas)]
+        if self.recipe is not None:
+            antenna_titles = [self.recipe.antenna_names[i] for i in range(self.stamp.numAntennas)]
+
+        fig, axs = plot_multiple([(antenna_titles[i], antennas[:, :, i])
                        for i in range(self.stamp.numAntennas)])
 
         for ax_r in range(axs.shape[0]):
             for ax_c in range(axs.shape[1]):
                 ax = axs[ax_r, ax_c]
-                    
+
                 yticks = ax.get_yticks()
                 if ax_c == 0:
                     ax.set_yticklabels([
@@ -258,8 +360,37 @@ class Stamp(object):
                     for tick in xticks
                 ])
                 ax.set_xlabel(f"Frequency (kHz + {self.stamp.fch1:0.6f} MHz)")
+
+                # Plot detected signal if given
+                if show_signal and (ax.axison):
+                    frequency = self.stamp.signal.frequency
+                    drift_rate = self.stamp.signal.driftRate
+                    # Figure out where the frequency is in plot coordinates
+                    # plot_width = self.stamp.numChannels * self.stamp.foff
+                    plot_frequency_x = ((frequency - self.stamp.fch1)) / self.stamp.foff
+                    if drift_rate == 0:
+                        # Plot vertical line
+                        ax.axvline(plot_frequency_x, color='red', dashes=[1, 1, 1, 1], zorder=10000) # frequency in MHz, convert to KHz
+                        ax.plot()
+                    else:
+                        # find the frequency limits
+                        max_time_s = self.stamp.tsamp * self.stamp.numTimesteps
+                        # xaxis = np.linspace(plot_frequency_x, plot_frequency_x + (drift_rate * 1e6 / self.stamp.foff) * max_time_s, num=4)
+                        xaxis = np.linspace(plot_frequency_x, plot_frequency_x + self.stamp.signal.driftSteps, num=4)
+                        yaxis = np.linspace(0, self.stamp.numTimesteps - 1, num=4)
+                        ax.plot(xaxis, yaxis, color='red', dashes=[1, 1, 1, 1], zorder=10000)
+                else:
+                    ax.plot()
         
-        plt.show()
+        # Plot a title if one is provided
+        if title != None:
+            plt.title(title)
+
+        # Save figure to file if selected
+        if save_to == None:
+            plt.show()
+        else:
+            plt.savefig(save_to)
         plt.close()
 
     def times(self):
@@ -318,14 +449,61 @@ class Stamp(object):
         squared = np.square(np.real(voltage)) + np.square(np.imag(voltage))
         return squared.sum(axis=2)
 
-    def show_beam(self, beam):
+    def show_beam(self, beam, title=None, show_signal=False, save_to=None):
         power = self.beamform_power(beam)
         snr, sig = self.snr_and_signal(power)
         print(f"recalculated power: {sig:e}")
         print("local SNR:", snr)
-        show_array(power)
+        # Plot the array
+        fig, ax = plot_array(power)
 
-    def show_best_beam(self):
+        # Add good plot tick marks and labels
+        yticks = ax.get_yticks()
+        ax.set_yticklabels([
+            f"{tick*self.stamp.tsamp*1e3:0.3f}"
+            for tick in yticks
+        ])
+        ax.set_ylabel("ms")
+        xticks = ax.get_xticks()
+        ax.set_xticklabels([
+            f"{(tick*self.stamp.foff*1000):0.1f}"
+            for tick in xticks
+        ])
+        ax.set_xlabel(f"Frequency (kHz + {self.stamp.fch1:0.6f} MHz)")
+
+        # Plot detected signal if given
+        if show_signal and (ax.axison):
+            frequency = self.stamp.signal.frequency
+            drift_rate = self.stamp.signal.driftRate
+            # Figure out where the frequency is in plot coordinates
+            # plot_width = self.stamp.numChannels * self.stamp.foff
+            plot_frequency_x = ((frequency - self.stamp.fch1)) / self.stamp.foff
+            if drift_rate == 0:
+                # Plot vertical line
+                ax.axvline(plot_frequency_x, color='red', dashes=[1, 1, 1, 1], zorder=10000) # frequency in MHz, convert to KHz
+                ax.plot()
+            else:
+                # find the frequency limits
+                max_time_s = self.stamp.tsamp * self.stamp.numTimesteps
+                # xaxis = np.linspace(plot_frequency_x, plot_frequency_x + (drift_rate * 1e6 / self.stamp.foff) * max_time_s, num=4)
+                xaxis = np.linspace(plot_frequency_x, plot_frequency_x + self.stamp.signal.driftSteps, num=4)
+                yaxis = np.linspace(0, self.stamp.numTimesteps - 1, num=4)
+                ax.plot(xaxis, yaxis, color='red', dashes=[1, 1, 1, 1], zorder=10000)
+        else:
+            ax.plot()
+        
+        # Plot a title if one is provided
+        if title != None:
+            plt.title(title)
+
+        # Save figure to file if selected
+        if save_to == None:
+            plt.show()
+        else:
+            plt.savefig(save_to)
+        plt.close()
+
+    def show_best_beam(self, title=None, show_signal=False, save_to=None):
         beam = self.stamp.signal.beam
         if beam < 0:
             print("best beam is incoherent")
@@ -336,16 +514,70 @@ class Stamp(object):
         print("best beam is", beam)
         print(f"original power: {self.stamp.signal.power:e}")
         print("original SNR:", self.stamp.signal.snr)
-        self.show_beam(beam)
+        self.show_beam(beam, title, show_signal, save_to)
 
-    def show_beams(self):
+    def show_beams(self, title=None, show_signal=False, save_to=None):
         charts = []
         for beam in range(self.recipe.nbeams):
             power = self.beamform_power(beam)
             snr = self.snr(power)
             charts.append((f"beam {beam}, snr {snr:.1f}", power))
-        show_multiple(charts)
+        
+        fig, axs = plot_multiple(charts)
 
+        for ax_r in range(axs.shape[0]):
+            for ax_c in range(axs.shape[1]):
+                ax = axs[ax_r, ax_c]
+
+                yticks = ax.get_yticks()
+                if ax_c == 0:
+                    ax.set_yticklabels([
+                        f"{tick*self.stamp.tsamp*1e3:0.3f}"
+                        for tick in yticks
+                    ])
+                    ax.set_ylabel("ms")
+                else:
+                    ax.set_yticklabels([])
+                
+                xticks = ax.get_xticks()
+                ax.set_xticklabels([
+                    f"{(tick*self.stamp.foff*1000):0.1f}"
+                    for tick in xticks
+                ])
+                ax.set_xlabel(f"Frequency (kHz + {self.stamp.fch1:0.6f} MHz)")
+
+                # Plot detected signal if given
+                if show_signal and (ax.axison):
+                    frequency = self.stamp.signal.frequency
+                    drift_rate = self.stamp.signal.driftRate
+                    # Figure out where the frequency is in plot coordinates
+                    # plot_width = self.stamp.numChannels * self.stamp.foff
+                    plot_frequency_x = ((frequency - self.stamp.fch1)) / self.stamp.foff
+                    if drift_rate == 0:
+                        # Plot vertical line
+                        ax.axvline(plot_frequency_x, color='red', dashes=[1, 1, 1, 1], zorder=10000) # frequency in MHz, convert to KHz
+                        ax.plot()
+                    else:
+                        # find the frequency limits
+                        max_time_s = self.stamp.tsamp * self.stamp.numTimesteps
+                        # xaxis = np.linspace(plot_frequency_x, plot_frequency_x + (drift_rate * 1e6 / self.stamp.foff) * max_time_s, num=4)
+                        xaxis = np.linspace(plot_frequency_x, plot_frequency_x + self.stamp.signal.driftSteps, num=4)
+                        yaxis = np.linspace(0, self.stamp.numTimesteps - 1, num=4)
+                        ax.plot(xaxis, yaxis, color='red', dashes=[1, 1, 1, 1], zorder=10000)
+                else:
+                    ax.plot()
+        
+        # Plot a title if one is provided
+        if title != None:
+            plt.title(title)
+
+        # Save figure to file if selected
+        if save_to == None:
+            plt.show()
+        else:
+            plt.savefig(save_to)
+        plt.close()
+        
     def signal_mask(self):
         """A bool array flagging which spots are the signal we detected"""
         # We currently don't handle STI
@@ -377,7 +609,7 @@ class Stamp(object):
         return ((signal - mean) / std, signal)
 
     def snr(self, data):
-        snr, _ = self.snr_and_signal()
+        snr, _ = self.snr_and_signal(data)
         return snr
 
     def masked_antenna_values(self):
@@ -430,6 +662,7 @@ class Stamp(object):
         nants = self.stamp.numAntennas
         print("median correlation:", np.median(corr))
         size = 15
+        _import_matplotlib()
         fig, ax = plt.subplots(figsize=(size, size))
         ax.imshow(corr, rasterized=True, interpolation="nearest", cmap="plasma", vmin=0)
         ax.set_yticks(list(range(nants)))
@@ -445,49 +678,69 @@ class Stamp(object):
         for i in range(nants):
             print(f"{i:2d} " + " ".join(f"{corr[i, j]:.2f}" for j in range(nants)))
 
-            
-        
-def read_stamps(filename):
-    with open(filename) as f:
-        stamps = stamp_capnp.Stamp.read_multiple(f, traversal_limit_in_words=2**30)
-        for s in stamps:
-            yield Stamp(s)
 
-def read_events(filename):
-    with open(filename) as f:
-        events = hit_capnp.Event.read_multiple(f)
-        for e in events:
-            yield e
-            
-def main():
-    for hit in read_hits("data/voyager.hits"):
-        print(hit.filterbank.numChannels, "x", hit.filterbank.numTimesteps,
-              "=", len(hit.filterbank.data))
+def find_stamp_recipe(stamp_filepath, directory_path=None):
+    """
+    Get the Recipe for the BFR5 that matches the given stamp
+    (just the filepath that is most similar and ends with .bfr5).
+    """
+    if directory_path is None:
+        directory_path = os.path.dirname(stamp_filepath)
+
+    closest_bfr5 = None
+    closest_commonlen = 0
+    for root, dirs, files in os.walk(directory_path, topdown=True):
+        for f in filter(lambda x: x.endswith("bfr5"), files):
+            filepath = os.path.join(root, f)
+            commonpath = os.path.commonpath([filepath, stamp_filepath])
+            commonlen = len(commonpath)
+            if commonlen > closest_commonlen:
+                closest_bfr5 = filepath
+                closest_commonlen = commonlen
+        break
+
+    if closest_bfr5 is None:
+        return None
+    try:
+        return Recipe(closest_bfr5)
+    except BaseException as err:
+        print(f"Error encountered instantiating Recipe from '{closest_bfr5}': {err}")
+        print(traceback.format_exc())
+        return False
+
+def read_stamps(filepath, find_recipe=False):
+    with open(filepath) as f:
+        stamps = stamp_capnp.Stamp.read_multiple(f, traversal_limit_in_words=2**30)
+        recipe = None
+        if find_recipe:
+            recipe = find_stamp_recipe(filepath)
+
+        for s in stamps:
+            yield Stamp(s, recipe)
 
 def find_stamp_files(directory):
     "Find all stamp files under this directory."
     for root, dirs, files in os.walk(directory, topdown=False):
-        for f in files:
-            full = os.path.join(root, f)
-            if full.endswith(".stamps"):
-                yield full
-            elif full.endswith(".stamp"):
-                yield full
-                
+        for f in filter(lambda f: os.path.splitext()[-1] in [".stamps", ".stamp"], files):
+            yield os.path.join(root, f)
+
 def scan_dir(directory):
     """
     Display antenna data for each stamp file under this directory.
     """
     count = 0
-    for stamp_filename in find_stamp_files(directory):
+    for stamp_filepath in find_stamp_files(directory):
         try:
-            for (i, stamp) in enumerate(read_stamps(stamp_filename)):
-                print(f"stamp {i} from {stamp_filename}")
+            for (i, stamp) in enumerate(read_stamps(stamp_filepath)):
+                print(f"stamp {i} from {stamp_filepath}")
                 stamp.show_antennas()
                 count += 1
         except Exception as e:
-            print(f"error opening {stamp_filename}: {e}")
+            print(f"error opening {stamp_filepath}: {e}")
     print(count, "stamps shown total")
         
-if __name__ == "__main__":
-    main()
+
+def main():
+    for hit in read_hits("data/voyager.hits"):
+        print(hit.filterbank.numChannels, "x", hit.filterbank.numTimesteps,
+              "=", len(hit.filterbank.data))
