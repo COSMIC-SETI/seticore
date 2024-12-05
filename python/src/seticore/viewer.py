@@ -152,6 +152,21 @@ class Recipe(object):
         i, _ = min(dist_tuples)
         return i
 
+
+def signal_mask(signal, startChannel, numChannels, numTimesteps):
+    """A bool array flagging which spots are the signal we detected"""
+    # We currently don't handle STI
+    assert signal.numTimesteps * 2 > numTimesteps
+
+    mask = np.zeros((numTimesteps, numChannels),
+                    dtype=bool)
+    drifts = interpolate_drift(signal.driftSteps,
+                                signal.numTimesteps)
+    hit_offset = signal.index - startChannel
+    for timestep, drift in enumerate(drifts):
+        mask[timestep, hit_offset + drift] = True
+    return mask
+
     
 class Stamp(object):
     def __init__(self, stamp, recipe=None):
@@ -580,17 +595,12 @@ class Stamp(object):
         
     def signal_mask(self):
         """A bool array flagging which spots are the signal we detected"""
-        # We currently don't handle STI
-        assert self.stamp.signal.numTimesteps * 2 > self.stamp.numTimesteps
-
-        mask = np.zeros((self.stamp.numTimesteps, self.stamp.numChannels),
-                        dtype=np.bool)
-        drifts = interpolate_drift(self.stamp.signal.driftSteps,
-                                   self.stamp.signal.numTimesteps)
-        hit_offset = self.stamp.signal.index - self.stamp.startChannel
-        for timestep, drift in enumerate(drifts):
-            mask[timestep, hit_offset + drift] = True
-        return mask
+        return signal_mask(
+            self.stamp.signal,
+            self.stamp.startChannel,
+            self.stamp.numChannels,
+            self.stamp.numTimesteps
+        )
 
     def show_mask(self):
         show_array(self.signal_mask())
